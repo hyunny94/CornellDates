@@ -14,13 +14,11 @@ from ask_sdk_core.handler_input import HandlerInput
 
 from ask_sdk_model import Response
 
-import boto3
 from botocore.exceptions import ClientError
-from boto3.dynamodb.conditions import Key
 
-from utils import get_default_academic_year, pick_closest_event_for_grade
+from utils import get_default_academic_year, pick_closest_event_for_grade,\
+    get_event_abb_name, query_ddb, get_default_apologetic_response, get_speak_output
 
-import time
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -29,12 +27,7 @@ DEFAULT_ACADEMIC_YEAR = get_default_academic_year()
 DEFAULT_LOCATION = "ithaca"
 DEFAULT_GRADE = "freshman"
 DYNAMODB_TABLE_NAME = "CornellDates" + DEFAULT_ACADEMIC_YEAR
-SSML_START = "<speak>"
-SSML_EMPHASIS_STRONG_START = '<emphasis level="strong">'
-SSML_EMPHASIS_STRONG_END = '</emphasis>'
-SSML_EMPHASIS_MODERATE_START = '<emphasis level="moderate">'
-SSML_EMPHASIS_MODERATE_END = '</emphasis>'
-SSML_END = "</speak>"
+
 
 
 class LaunchRequestHandler(AbstractRequestHandler):
@@ -83,83 +76,28 @@ class WhenIsEventIntentHandler(AbstractRequestHandler):
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
         
-        # 1. Retrieve slots from alexa
+        # 1. Retrieve info from the slots passed from alexa
         slots = handler_input.request_envelope.request.intent.slots
-        if slots['DeadlineEvent'].resolutions:
-            if slots['DeadlineEvent'].resolutions.resolutions_per_authority[0].values:
-                event_abb_name = slots["DeadlineEvent"].resolutions.resolutions_per_authority[0].values[0].value.name
-            else:
-                raise Exception("sorry we have the event on record but can you try rephrasing your question?")
-        elif slots['PeriodEvent'].resolutions:
-            if slots['PeriodEvent'].resolutions.resolutions_per_authority[0].values:
-                event_abb_name = slots["PeriodEvent"].resolutions.resolutions_per_authority[0].values[0].value.name
-            else:
-                raise Exception("sorry we have the event on record but can you try rephrasing your question?")
-        elif slots['ReleaseEvent'].resolutions:
-            if slots['ReleaseEvent'].resolutions.resolutions_per_authority[0].values:
-                event_abb_name = slots["ReleaseEvent"].resolutions.resolutions_per_authority[0].values[0].value.name
-            else:
-                raise Exception("sorry we have the event on record but can you try rephrasing your question?")
-        else:
-            raise Exception("sorry we cannot answer the question at this time.")
+        possible_slot_types = ["PeriodEvent", "DeadlineEvent", "ReleaseEvent"]
+        try:
+            event_abb_name = get_event_abb_name(slots, possible_slot_types)
+        except Exception as e:
+            return get_default_apologetic_response(handler_input)
 
         # 2. Query the dynamoDB
         try:
-            client = boto3.client('dynamodb')
-            response = client.query(
-                ExpressionAttributeValues={
-                    ':v1': {
-                        'S': event_abb_name,
-                    },
-                },
-                KeyConditionExpression="event_abb_name = :v1",
-                TableName=DYNAMODB_TABLE_NAME,
-            )
-            print(response)
+            event = query_ddb(DYNAMODB_TABLE_NAME, DEFAULT_GRADE, event_abb_name)
         except ClientError as e:
-            print(e.response['Error']['Message'])
-        else:
-            event = pick_closest_event_for_grade(response['Items'], DEFAULT_GRADE)
+            return get_default_apologetic_response(handler_input)
+        except Exception as e:
+            return get_default_apologetic_response(handler_input)
 
         # 3. format the answer
-        date_granularity = event['date_granularity']['S']
-        internal_category = event['internal_category']['S']
-        start = int(event['start']['N'])
-        speak_output = SSML_START
-        speak_output += event_abb_name
-        # depending on 
-        # 3.1 this event's ['date_granularity'] => one of ["date", "hour"]
-        if internal_category == 'period':
-            end = int(event['end']['N'])
-            if date_granularity == "date":
-                start = time.strftime('%Y-%m-%d', time.localtime(start))
-                end = time.strftime('%Y-%m-%d', time.localtime(end))
-            elif date_granularity == "hour": 
-                start = time.strftime('%Y-%m-%d %H:%M', time.localtime(start))
-                end = time.strftime('%Y-%m-%d %H:%M', time.localtime(end))
-        elif internal_category == 'release':
-            if date_granularity == "date":
-                start = time.strftime('%Y-%m-%d', time.localtime(start))
-            elif date_granularity == "hour": 
-                start = time.strftime('%Y-%m-%d %H:%M', time.localtime(start))
-        else: # internal_category == 'deadline'
-            if date_granularity == "date":
-                start = time.strftime('%Y-%m-%d', time.localtime(start))
-            elif date_granularity == "hour": 
-                start = time.strftime('%Y-%m-%d %H:%M', time.localtime(start))
+        try:
+            speak_output = get_speak_output(event)
+        except Exception as e:
+            return get_default_apologetic_response(handler_input)
         
-        # 3.2 this event's ['internal_category'] => "period" means the event has "start" and "end"
-        if internal_category == 'period':
-            speak_output += " is from " +\
-                 SSML_EMPHASIS_MODERATE_START + start + SSML_EMPHASIS_MODERATE_END +\
-                      " until " +\
-                           SSML_EMPHASIS_MODERATE_START + end + SSML_EMPHASIS_MODERATE_END
-        else:
-            speak_output += " is on " +\
-                SSML_EMPHASIS_MODERATE_START + start + SSML_EMPHASIS_MODERATE_END
-
-        speak_output += SSML_END
-
         # 4. respond
         return (
             handler_input.response_builder
